@@ -61,9 +61,11 @@ jobs:
             --document-name "AWS-RunShellScript" \
             --parameters 'commands=[
               "cd /home/ubuntu/simple-app/simple-app/api",
+              "git config --global --add safe.directory /home/ubuntu/simple-app",
+              "cd /home/ubuntu/simple-app/simple-app/api",
               "git pull origin main",
               "npm install --production",
-              "pm2 restart simple-app-api --update-env"
+              "pm2 restart simple-api --update-env"
             ]' \
             --query "Command.CommandId" \
             --output text)
@@ -145,7 +147,8 @@ jobs:
             --instance-ids "${{ secrets.EC2_INSTANCE_ID }}" \
             --document-name "AWS-RunShellScript" \
             --parameters 'commands=[
-              "cd /home/ubuntu/simple-app/simple-app/ui",
+              "git config --global --add safe.directory /home/ubuntu/simple-app",
+              "cd /home/ubuntu/simple-app/simple-app/api",
               "git pull origin main",
               "pm2 restart ecosystem.config.js --update-env"
             ]' \
