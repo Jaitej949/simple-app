@@ -28,9 +28,9 @@ jobs:
         with:
           filters: |
             api:
-              - 'simple-app/simple-app/api/**'
+              - 'simple-app/api/**'
             ui:
-              - 'simple-app/simple-app/ui/**'
+              - 'simple-app/ui/**'
 
   # ─────────────────────────────────────────
   # JOB 2: Deploy API (runs only if API changed)
