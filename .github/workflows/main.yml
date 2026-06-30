@@ -1,20 +1,26 @@
-name: Deploy to EC2
+name: Deploy SimpleApp
 
 on:
   push:
     branches:
       - main
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
 
 jobs:
-  # ─────────────────────────────────────────
-  # JOB 1: Detect which paths changed
-  # ─────────────────────────────────────────
+
+  # ─────────────────────────────────────────────
+  # Detect what changed
+  # ─────────────────────────────────────────────
   detect-changes:
     name: Detect Changed Paths
     runs-on: ubuntu-latest
     outputs:
       api: ${{ steps.filter.outputs.api }}
-      ui: ${{ steps.filter.outputs.ui }}
+      ui:  ${{ steps.filter.outputs.ui }}
 
     steps:
       - name: Checkout code
@@ -28,146 +34,189 @@ jobs:
         with:
           filters: |
             api:
-              - 'simple-app/api/**'
+              - 'src/api/**'
             ui:
-              - 'simple-app/ui/**'
+              - 'src/ui/**'
 
-  # ─────────────────────────────────────────
-  # JOB 2: Deploy API (runs only if API changed)
-  # ─────────────────────────────────────────
+  # ─────────────────────────────────────────────
+  # Deploy API — Django
+  # ─────────────────────────────────────────────
   deploy-api:
-    name: Deploy API (Node/Express)
+    name: Deploy API (Django)
     runs-on: ubuntu-latest
     needs: detect-changes
     if: needs.detect-changes.outputs.api == 'true'
 
-    permissions:
-      id-token: write
-      contents: read
-
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Configure AWS credentials via OIDC
+      - name: Configure AWS credentials (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.ROLE_TO_ASSUME }}
-          aws-region: ${{ secrets.AWS_REGION }}
+          aws-region:     ${{ secrets.AWS_REGION }}
 
-      - name: Deploy API via SSM
+      # Step outputs id so COMMAND_ID is accessible via steps.ssm.outputs.command_id
+      - name: Send SSM deploy command
+        id: ssm
         run: |
           COMMAND_ID=$(aws ssm send-command \
             --instance-ids "${{ secrets.EC2_INSTANCE_ID }}" \
             --document-name "AWS-RunShellScript" \
+            --comment "API deploy ${{ github.sha }}" \
+            --region "${{ secrets.AWS_REGION }}" \
             --parameters 'commands=[
-              "cd /home/ubuntu/simple-app/simple-app/api",
-              "git config --global --add safe.directory /home/ubuntu/simple-app",
-              "cd /home/ubuntu/simple-app/simple-app/api",
-              "git pull origin main",
-              "npm install --production",
-              "pm2 restart simple-api --update-env"
-            ]' \
+              "bash -c '\''set -e && export HOME=/home/ubuntu && git config --system --add safe.directory /home/ubuntu/InfraSight360 && echo === API Deploy: $(date) === && cd /home/ubuntu/InfraSight360/src/api && git fetch origin && git reset --hard origin/main && source /home/ubuntu/venv_InfraSight360/bin/activate && pip3 install -r requirements.txt --quiet && python3 manage.py migrate --noinput && sudo supervisorctl restart all && echo === API Deploy Done: $(date) ==='\''"]' \
             --query "Command.CommandId" \
             --output text)
 
-          echo "Command ID: $COMMAND_ID"
+          echo "SSM Command ID: $COMMAND_ID"
+          echo "command_id=$COMMAND_ID" >> $GITHUB_OUTPUT
 
-          # Wait (ignore failure so we can still fetch output)
+      - name: Wait for command to complete
+        run: |
           aws ssm wait command-executed \
-            --command-id "$COMMAND_ID" \
-            --instance-id "${{ secrets.EC2_INSTANCE_ID }}" || true
-
-          # Print stdout
-          echo "=== STDOUT ==="
-          aws ssm get-command-invocation \
-            --command-id "$COMMAND_ID" \
+            --command-id "${{ steps.ssm.outputs.command_id }}" \
             --instance-id "${{ secrets.EC2_INSTANCE_ID }}" \
-            --query "StandardOutputContent" \
-            --output text
+            --region "${{ secrets.AWS_REGION }}"
 
-          # Print stderr
-          echo "=== STDERR ==="
+      - name: Show deploy output
+        if: always()
+        run: |
           aws ssm get-command-invocation \
-            --command-id "$COMMAND_ID" \
+            --command-id "${{ steps.ssm.outputs.command_id }}" \
             --instance-id "${{ secrets.EC2_INSTANCE_ID }}" \
-            --query "StandardErrorContent" \
-            --output text
+            --region "${{ secrets.AWS_REGION }}" \
+            --query "{Status:Status,Output:StandardOutputContent,Error:StandardErrorContent}" \
+            --output json
 
-          # Get status and fail if not Success
+      - name: Check deploy status
+        run: |
           STATUS=$(aws ssm get-command-invocation \
-            --command-id "$COMMAND_ID" \
+            --command-id "${{ steps.ssm.outputs.command_id }}" \
             --instance-id "${{ secrets.EC2_INSTANCE_ID }}" \
+            --region "${{ secrets.AWS_REGION }}" \
             --query "Status" \
             --output text)
+
           echo "Status: $STATUS"
           [ "$STATUS" = "Success" ] || exit 1
 
-          echo "Command ID: $COMMAND_ID"
-
-          aws ssm wait command-executed \
-            --command-id "$COMMAND_ID" \
-            --instance-id "${{ secrets.EC2_INSTANCE_ID }}"
-
-          aws ssm get-command-invocation \
-            --command-id "$COMMAND_ID" \
-            --instance-id "${{ secrets.EC2_INSTANCE_ID }}" \
-            --query "StandardOutputContent" \
-            --output text
-
-      - name: Health check
+      - name: Health check API
         run: |
-          sleep 5
-          curl -f http://${{ secrets.EC2_PUBLIC_IP }}/health || exit 1
+          for i in 1 2 3 4 5; do
+            sleep 10
+            echo "Health check attempt $i/5..."
+            if curl --fail --silent --max-time 10 \
+              http://${{ secrets.EC2_HOST }}/health; then
+              echo "API is healthy"
+              exit 0
+            fi
+            echo "Not ready yet..."
+          done
+          echo "API health check failed"
+          exit 1
 
-  # ─────────────────────────────────────────
-  # JOB 3: Deploy UI (runs only if UI changed)
-  # ─────────────────────────────────────────
+  # ─────────────────────────────────────────────
+  # Deploy UI — React/Node
+  # ─────────────────────────────────────────────
   deploy-ui:
-    name: Deploy UI (Static/React)
+    name: Deploy UI (Node/React)
     runs-on: ubuntu-latest
     needs: detect-changes
     if: needs.detect-changes.outputs.ui == 'true'
 
-    permissions:
-      id-token: write
-      contents: read
-
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Configure AWS credentials via OIDC
+      - name: Configure AWS credentials (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.ROLE_TO_ASSUME }}
-          aws-region: ${{ secrets.AWS_REGION }}
+          aws-region:     ${{ secrets.AWS_REGION }}
 
-      - name: Deploy UI via SSM
+      - name: Send SSM deploy command
+        id: ssm
         run: |
           COMMAND_ID=$(aws ssm send-command \
             --instance-ids "${{ secrets.EC2_INSTANCE_ID }}" \
             --document-name "AWS-RunShellScript" \
+            --comment "UI deploy ${{ github.sha }}" \
+            --region "${{ secrets.AWS_REGION }}" \
             --parameters 'commands=[
-              "git config --global --add safe.directory /home/ubuntu/simple-app",
-              "cd /home/ubuntu/simple-app/simple-app/api",
-              "git pull origin main",
-              "pm2 restart ecosystem.config.js --update-env"
-            ]' \
+              "bash -c '\''set -e && export HOME=/home/ubuntu && export PATH=/usr/bin:/usr/local/bin:$PATH && git config --system --add safe.directory /home/ubuntu/InfraSight360 && echo Node: $(node -v) && echo === UI Deploy: $(date) === && cd /home/ubuntu/InfraSight360/src/ui && git fetch origin && git reset --hard origin/main && npm ci && npm run build && pm2 restart ecosystem.config.js --update-env && pm2 save && sudo nginx -t && sudo systemctl reload nginx && echo === UI Deploy Done: $(date) ==='\''"]' \
             --query "Command.CommandId" \
             --output text)
 
-          echo "Command ID: $COMMAND_ID"
+          echo "SSM Command ID: $COMMAND_ID"
+          echo "command_id=$COMMAND_ID" >> $GITHUB_OUTPUT
 
-          aws ssm wait command-executed \
-            --command-id "$COMMAND_ID" \
-            --instance-id "${{ secrets.EC2_INSTANCE_ID }}"
-
-          aws ssm get-command-invocation \
-            --command-id "$COMMAND_ID" \
-            --instance-id "${{ secrets.EC2_INSTANCE_ID }}" \
-            --query "StandardOutputContent" \
-            --output text
-
-      - name: Health check
+      - name: Wait for command to complete
         run: |
-          sleep 5
-          curl -f http://${{ secrets.EC2_PUBLIC_IP }} || exit 1
+          aws ssm wait command-executed \
+            --command-id "${{ steps.ssm.outputs.command_id }}" \
+            --instance-id "${{ secrets.EC2_INSTANCE_ID }}" \
+            --region "${{ secrets.AWS_REGION }}"
+
+      - name: Show deploy output
+        if: always()
+        run: |
+          aws ssm get-command-invocation \
+            --command-id "${{ steps.ssm.outputs.command_id }}" \
+            --instance-id "${{ secrets.EC2_INSTANCE_ID }}" \
+            --region "${{ secrets.AWS_REGION }}" \
+            --query "{Status:Status,Output:StandardOutputContent,Error:StandardErrorContent}" \
+            --output json
+
+      - name: Check deploy status
+        run: |
+          STATUS=$(aws ssm get-command-invocation \
+            --command-id "${{ steps.ssm.outputs.command_id }}" \
+            --instance-id "${{ secrets.EC2_INSTANCE_ID }}" \
+            --region "${{ secrets.AWS_REGION }}" \
+            --query "Status" \
+            --output text)
+
+          echo "Status: $STATUS"
+          [ "$STATUS" = "Success" ] || exit 1
+
+      - name: Health check UI
+        run: |
+          for i in 1 2 3 4 5; do
+            sleep 10
+            echo "Health check attempt $i/5..."
+            if curl --fail --silent --max-time 10 \
+              http://${{ secrets.EC2_HOST }}; then
+              echo "UI is healthy"
+              exit 0
+            fi
+            echo "Not ready yet..."
+          done
+          echo "UI health check failed"
+          exit 1
+
+  # ─────────────────────────────────────────────
+  # Summary
+  # ─────────────────────────────────────────────
+  notify:
+    name: Deployment Summary
+    runs-on: ubuntu-latest
+    needs: [deploy-api, deploy-ui]
+    if: always()
+
+    steps:
+      - name: Summary
+        run: |
+          echo "=============================="
+          echo "  Deployment Summary"
+          echo "=============================="
+          echo "Branch: ${{ github.ref_name }}"
+          echo "Commit: ${{ github.sha }}"
+          echo "Actor:  ${{ github.actor }}"
+          echo "API:    ${{ needs.deploy-api.result }}"
+          echo "UI:     ${{ needs.deploy-ui.result }}"
+          echo "=============================="
+
+          if [ "${{ needs.deploy-api.result }}" = "failure" ] || \
+             [ "${{ needs.deploy-ui.result }}" = "failure" ]; then
+            echo "One or more deployments FAILED"
+            exit 1
+          fi
+
+          echo "All deployments succeeded"
